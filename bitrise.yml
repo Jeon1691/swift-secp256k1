@@ -161,7 +161,8 @@ workflows:
             # under -dead_strip, invisible to builds — plus a real consumer
             # build of the shipped artifact per platform: `swift test` on
             # macOS and `xcodebuild build-for-testing` for each name this
-            # step archived (interface typechecking already happened at
+            # step archived, then the suite executed on an iOS Simulator
+            # (interface typechecking already happened at
             # archive emit via -verify-emitted-module-interface). Shared
             # with the release workflow so both verify the same thing.
             bash Scripts/verify-p256k-xcframework.sh P256K.xcframework "${PLATFORMS[@]}"
