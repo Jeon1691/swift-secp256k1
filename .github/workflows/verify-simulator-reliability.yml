@@ -1,0 +1,86 @@
+# TEMPORARY — fork-only harness, not for upstream. Runs the patched
+# Scripts/verify-p256k-xcframework.sh (selection-failure dump + single retry on
+# a runner that never connects) against a published release asset on the same
+# image and toolchain pin as xcframework-release.yml. Negative controls must
+# fail closed without a retry.
+name: Verify simulator reliability (temporary)
+on:
+  push:
+    branches: ['verify/**']
+permissions: {}
+jobs:
+  verify:
+    name: ${{ matrix.case }}
+    runs-on: xcode-27
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        case: [gate-1, gate-2, gate-3, fail-control, zero-control]
+    env:
+      # Same pin as xcframework-release.yml.
+      DEVELOPER_DIR: /Applications/Xcode_27.0.app/Contents/Developer
+      RELEASE_TAG: '0.25.1'
+      # Digest GitHub records for the 0.25.1 P256K.xcframework.zip asset.
+      EXPECTED_SHA256: 98ae10faf5655da4240355432add79f5733dc666a162ed06ed0d5f051a48dbaa
+      CASE: ${{ matrix.case }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Environment
+        run: |
+          xcodebuild -version
+          echo "image: $ImageOS $ImageVersion"
+          echo "bash: $(/bin/bash --version | head -1)"
+      - name: Fetch release artifact
+        run: |
+          curl -sSfL --retry 3 -o "$RUNNER_TEMP/P256K.xcframework.zip" \
+            "https://github.com/21-DOT-DEV/swift-secp256k1/releases/download/$RELEASE_TAG/P256K.xcframework.zip"
+          echo "$EXPECTED_SHA256  $RUNNER_TEMP/P256K.xcframework.zip" | shasum -a 256 -c
+          unzip -q "$RUNNER_TEMP/P256K.xcframework.zip" -d "$RUNNER_TEMP/xcf"
+      - name: Prepare negative control
+        if: endsWith(matrix.case, '-control')
+        run: |
+          f=Tests/XCFrameworkTests/XCFrameworkTests.swift
+          if [ "$CASE" = fail-control ]; then
+            # Deliberate iOS-only failure; macOS must still pass.
+            perl -0pi -e 's/(        #expect\(String\(bytes: privateKey\.dataRepresentation\) == expectedPrivateKey\)\n)/$1        #if os(iOS)\n        #expect(Bool(false), "negative control: deliberate iOS-only failure")\n        #endif\n/' "$f"
+            grep -q 'negative control' "$f"
+          else
+            # Zero tests on iOS; macOS still runs the suite.
+            perl -0pi -e 's/(struct XCFrameworkTestSuite)/#if !os(iOS)\n$1/; s/\z/#endif\n/' "$f"
+            grep -q '#if !os(iOS)' "$f"
+          fi
+          git diff --stat
+      - name: Run verifier (timestamped)
+        run: |
+          set +e
+          set -o pipefail
+          /bin/bash Scripts/verify-p256k-xcframework.sh "$RUNNER_TEMP/xcf/P256K.xcframework" \
+            "iOS" "iOS Simulator" "macOS" "tvOS" "tvOS Simulator" "watchOS" "watchOS Simulator" 2>&1 \
+            | while IFS= read -r line; do printf '%s %s\n' "$(date -u +%H:%M:%S)" "$line"; done > "$RUNNER_TEMP/verify.log"
+          rc=$?
+          set -e
+          cat "$RUNNER_TEMP/verify.log"
+          echo "verifier exit: $rc"
+          log="$RUNNER_TEMP/verify.log"
+          if grep -q 'retrying once' "$log"; then echo "RETRY OBSERVED in $CASE"; fi
+          case "$CASE" in
+            gate-*)
+              test "$rc" -eq 0
+              grep -q ' consumer test: iOS Simulator passed [1-9]' "$log" ;;
+            fail-control)
+              test "$rc" -ne 0
+              if grep -q 'retrying once' "$log"; then echo 'unexpected retry'; exit 1; fi  # '!' would not trip set -e
+              grep -q ' failure: .*Expectation failed' "$log"
+              grep -q ' error: iOS Simulator consumer test failed (xcodebuild exit ' "$log" ;;
+            zero-control)
+              test "$rc" -eq 1
+              if grep -q 'retrying once' "$log"; then echo 'unexpected retry'; exit 1; fi  # '!' would not trip set -e
+              grep -q ' error: iOS Simulator run reported no passing test' "$log" ;;
+          esac
+          echo "case $CASE: expected outcome observed"
+      - name: Simulator state after run
+        if: ${{ !cancelled() }}
+        run: xcrun simctl list devices booted
