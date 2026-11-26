@@ -123,6 +123,7 @@ run_simulator_leg() {
 simulator_legs=(
     "iOS Simulator|iOS|iphonesimulator|iPhone"
     "tvOS Simulator|tvOS|appletvsimulator|Apple TV"
+    "watchOS Simulator|watchOS|watchsimulator|Apple Watch"  # SPIKE ONLY: feasibility probe
 )
 for leg in "${simulator_legs[@]}"; do
     IFS='|' read -r dest platform sdk_name prefix <<<"$leg"
