@@ -1,0 +1,47 @@
+# TEMPORARY — fork-only experiment, not for upstream. One iOS Simulator leg per
+# fresh VM under three conditions, five VMs each, to find what drives the
+# "test runner hung before establishing connection" failure.
+name: Experiment iOS runner hang (temporary)
+on:
+  push:
+    branches: ['exp/**']
+permissions: {}
+jobs:
+  leg:
+    name: ${{ matrix.cond }}-${{ matrix.rep }}
+    runs-on: xcode-27
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        cond: [baseline, preboot, xcode272]
+        rep: [1, 2, 3, 4, 5]
+    env:
+      RELEASE_TAG: '0.25.1'
+      # Digest GitHub records for the 0.25.1 P256K.xcframework.zip asset.
+      EXPECTED_SHA256: 98ae10faf5655da4240355432add79f5733dc666a162ed06ed0d5f051a48dbaa
+      COND: ${{ matrix.cond }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Select toolchain
+        run: |
+          # Release pin is Xcode 27.0; the xcode272 condition swaps only the toolchain.
+          if [ "$COND" = xcode272 ]; then d=/Applications/Xcode_27.2.app/Contents/Developer; else d=/Applications/Xcode_27.0.app/Contents/Developer; fi
+          echo "DEVELOPER_DIR=$d" >> "$GITHUB_ENV"
+      - name: Environment
+        run: |
+          xcodebuild -version
+          echo "image: $ImageOS $ImageVersion"
+          xcrun simctl list --json | jq -r '
+            .devices as $d | .runtimes[] | select(.platform == "tvOS" or .platform == "iOS")
+            | "\(.platform) \(.version) runtime_available=\(.isAvailable) devtypes=\(.supportedDeviceTypes|length) available_devices=\([($d[.identifier] // [])[] | select(.isAvailable)] | length)"'
+      - name: Fetch release artifact
+        run: |
+          curl -sSfL --retry 3 -o "$RUNNER_TEMP/P256K.xcframework.zip" \
+            "https://github.com/21-DOT-DEV/swift-secp256k1/releases/download/$RELEASE_TAG/P256K.xcframework.zip"
+          echo "$EXPECTED_SHA256  $RUNNER_TEMP/P256K.xcframework.zip" | shasum -a 256 -c
+          unzip -q "$RUNNER_TEMP/P256K.xcframework.zip" -d "$RUNNER_TEMP/xcf"
+      - name: iOS leg
+        run: bash .github/exp/ios-leg.sh "$RUNNER_TEMP/xcf/P256K.xcframework" "$COND"
