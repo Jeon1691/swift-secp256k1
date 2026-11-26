@@ -84,14 +84,14 @@ if [[ " $* " == *" iOS Simulator "* ]]; then
            | ($r.version | ver) as $v | select(($v | major_minor) <= $cap)
            | ($devices[$r.identifier] // [])[] | select(.isAvailable and (.name | startswith("iPhone")))
            | {v: $v, version: $r.version, udid, state: (.state | gsub(" "; "_")), name}]
-        | max_by(.v) // empty | "\(.udid) \(.state) \(.name), iOS \(.version)"' <<<"$sims")
+        | max_by(.v) // empty | "\(.udid) \(.state) \(.name), iOS \(.version)"' <<<"$sims") || pick=''
     if [[ -z "$pick" ]]; then
         echo "iOS runtimes and devices simctl reported:" >&2
         jq -r 'def err: if .availabilityError then " (\(.availabilityError))" else "" end;
             def rt: ltrimstr("com.apple.CoreSimulator.SimRuntime.");
-            (.runtimes[] | select(.platform == "iOS")
+            (.runtimes[]? | select(.platform == "iOS")
              | "  runtime \(.identifier | rt) \(.version) available=\(.isAvailable) device_types=\(.supportedDeviceTypes | length)\(err)"),
-            (.devices | to_entries[] | select(.key | contains("SimRuntime.iOS-")) | (.key | rt) as $rt
+            (.devices // {} | to_entries[] | select(.key | contains("SimRuntime.iOS-")) | (.key | rt) as $rt
              | .value[] | "  device \($rt) \(.name) \(.state) available=\(.isAvailable)\(err)")' <<<"$sims" >&2 || true
         die "iOS Simulator slice archived but no available iPhone simulator on an iOS runtime ≤ the $sdk SDK"
     fi
@@ -115,8 +115,9 @@ if [[ " $* " == *" iOS Simulator "* ]]; then
         }
         ((rc != 0)) || break
         jq -r '.testFailures[]? | "failure: \(.testName // "?"): \(.failureText // "" | gsub("\n"; "\n    "))"' <<<"$summary" >&2 || true
-        # A runner that never connects is a simulator fault seen on fresh CI VMs, not a test verdict: retry it once.
-        if ((attempt == 1)) && jq -e 'any(.testFailures[]?; .failureText // "" | contains("hung before establishing connection"))' <<<"$summary" >/dev/null; then
+        # A runner that never connects is a simulator fault seen on fresh CI VMs, not a test verdict: retry it once,
+        # but only when that is every recorded failure, so a real test failure can't be retried into a pass.
+        if ((attempt == 1)) && jq -e '[.testFailures[]?.failureText // ""] | length > 0 and all(contains("hung before establishing connection"))' <<<"$summary" >/dev/null; then
             echo "warning: iOS Simulator test runner never connected; retrying once" >&2
         else
             echo "error: iOS Simulator consumer test failed (xcodebuild exit $rc)" >&2
