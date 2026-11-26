@@ -9,7 +9,7 @@
 #   consumers: Tests/XCFrameworkTests runs on macOS and builds+links for each platform
 #   against only the shipped interfaces (no libsecp256k1 module) — catches a leaked C
 #   import, a hollow or missing slice, and a missing standard arch — then runs on an
-#   iOS Simulator when that slice is archived, catching a slice that links but misbehaves.
+#   iOS and tvOS Simulator when those slices are archived, catching a slice that links but misbehaves.
 # Exit: 0 pass · 1 detected defect or usage · tool failures keep their own code.
 set -euo pipefail
 
@@ -18,10 +18,14 @@ shift
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 
 WORKDIR=$(mktemp -d)
-# Set only for a simulator that was Shutdown when picked; any other state may belong to someone else.
-booted_sim=''
+# Only simulators that were Shutdown when picked; any other state may belong to someone else.
+booted_sims=()
 cleanup() {
-    [[ -z "$booted_sim" ]] || xcrun simctl shutdown "$booted_sim" >/dev/null 2>&1 || true
+    local sim
+    # ${a[@]+...} keeps an empty array legal under set -u on bash 3.2 (macOS /bin/bash).
+    for sim in ${booted_sims[@]+"${booted_sims[@]}"}; do
+        xcrun simctl shutdown "$sim" >/dev/null 2>&1 || true
+    done
     rm -rf "$WORKDIR"
 }
 trap cleanup EXIT
@@ -68,49 +72,64 @@ for dest in "$@"; do
     xcodebuild build-for-testing -scheme "$scheme" -destination "generic/platform=$dest" -derivedDataPath "$WORKDIR/dd" CODE_SIGNING_ALLOWED=NO ONLY_ACTIVE_ARCH=NO -quiet
 done
 
-# build-for-testing proves the simulator slice links, not that it runs; no eligible iPhone fails the gate.
-# Newest iOS runtime whose major.minor ≤ the active SDK's (never one for a newer Xcode than the pin), compared
+# build-for-testing proves a simulator slice links, not that it runs; no eligible device fails the gate.
+# Newest runtime whose major.minor ≤ the active SDK's (never one for a newer Xcode than the pin), compared
 # numerically; single-device-type runtimes are skipped by type count because their IDs can look general (iOS-27-1).
-if [[ " $* " == *" iOS Simulator "* ]]; then
-    command -v jq >/dev/null || die "jq is required to select and judge the iOS Simulator run"
-    sdk=$(xcrun --sdk iphonesimulator --show-sdk-version)
-    pick=$(xcrun simctl list --json | jq -r --arg sdk "$sdk" '
+# Usage: run_simulator_leg <archive destination> <simctl platform> <SDK name> <device name prefix>
+run_simulator_leg() {
+    local dest=$1 platform=$2 sdk_name=$3 prefix=$4
+    local sdk pick sim state label result rc summary
+    sdk=$(xcrun --sdk "$sdk_name" --show-sdk-version)
+    pick=$(xcrun simctl list --json | jq -r --arg sdk "$sdk" --arg platform "$platform" --arg prefix "$prefix" '
         def ver: split(".") | map(tonumber);
         def major_minor: (. + [0, 0])[:2];
         ($sdk | ver | major_minor) as $cap | .devices as $devices
         | [.runtimes[] as $r
-           | select($r.platform == "iOS" and $r.isAvailable and ($r.supportedDeviceTypes | length) > 1)
+           | select($r.platform == $platform and $r.isAvailable and ($r.supportedDeviceTypes | length) > 1)
            | ($r.version | ver) as $v | select(($v | major_minor) <= $cap)
-           | ($devices[$r.identifier] // [])[] | select(.isAvailable and (.name | startswith("iPhone")))
+           | ($devices[$r.identifier] // [])[] | select(.isAvailable and (.name | startswith($prefix)))
            | {v: $v, version: $r.version, udid, state: (.state | gsub(" "; "_")), name}]
-        | max_by(.v) // empty | "\(.udid) \(.state) \(.name), iOS \(.version)"')
-    [[ -n "$pick" ]] || die "iOS Simulator slice archived but no available iPhone simulator on an iOS runtime ≤ the $sdk SDK"
+        | max_by(.v) // empty | "\(.udid) \(.state) \(.name), \($platform) \(.version)"')
+    [[ -n "$pick" ]] || die "$dest slice archived but no available $prefix simulator on a $platform runtime ≤ the $sdk SDK"
     read -r sim state label <<<"$pick"
     if [[ "$state" == Shutdown ]]; then
-        booted_sim=$sim
+        booted_sims+=("$sim")
     fi
-    echo "consumer test: iOS Simulator ($label)"
+    echo "consumer test: $dest ($label)"
 
     # -collect-test-diagnostics never: skip the simulator sysdiagnose a failing test otherwise waits on.
-    result="$WORKDIR/ios-simulator.xcresult"
+    result="$WORKDIR/$platform-simulator.xcresult"
     rc=0
-    xcodebuild test-without-building -scheme "$scheme" -destination "platform=iOS Simulator,id=$sim" -derivedDataPath "$WORKDIR/dd" -resultBundlePath "$result" -collect-test-diagnostics never -quiet || rc=$?
+    xcodebuild test-without-building -scheme "$scheme" -destination "platform=$dest,id=$sim" -derivedDataPath "$WORKDIR/dd" -resultBundlePath "$result" -collect-test-diagnostics never -quiet || rc=$?
 
     # The bundle is the only record of failure text: -quiet hides it and $WORKDIR is deleted on exit.
     summary=$(xcrun xcresulttool get test-results summary --path "$result" --compact) || {
-        echo "warning: could not read the iOS Simulator result bundle summary" >&2
+        echo "warning: could not read the $dest result bundle summary" >&2
         summary='{}'
     }
     if ((rc != 0)); then
         jq -r '.testFailures[]? | "failure: \(.testName // "?"): \(.failureText // "" | gsub("\n"; "\n    "))"' <<<"$summary" >&2 || true
-        echo "error: iOS Simulator consumer test failed (xcodebuild exit $rc)" >&2
+        echo "error: $dest consumer test failed (xcodebuild exit $rc)" >&2
         exit "$rc"
     fi
 
     # xcodebuild exits 0 when no Swift Testing test ran, so require ≥1 passing test from the bundle.
     jq -e '.result == "Passed" and .passedTests > 0 and .failedTests == 0' <<<"$summary" >/dev/null ||
-        die "iOS Simulator run reported no passing test: $(jq -c '{result, totalTestCount, passedTests, failedTests}' <<<"$summary")"
-    echo "consumer test: iOS Simulator passed $(jq -r '.passedTests' <<<"$summary") test(s)"
-fi
+        die "$dest run reported no passing test: $(jq -c '{result, totalTestCount, passedTests, failedTests}' <<<"$summary")"
+    echo "consumer test: $dest passed $(jq -r '.passedTests' <<<"$summary") test(s)"
+}
+
+# archive destination | simctl platform | SDK name | device name prefix
+simulator_legs=(
+    "iOS Simulator|iOS|iphonesimulator|iPhone"
+    "tvOS Simulator|tvOS|appletvsimulator|Apple TV"
+)
+for leg in "${simulator_legs[@]}"; do
+    IFS='|' read -r dest platform sdk_name prefix <<<"$leg"
+    if [[ " $* " == *" $dest "* ]]; then
+        command -v jq >/dev/null || die "jq is required to select and judge the simulator runs"
+        run_simulator_leg "$dest" "$platform" "$sdk_name" "$prefix"
+    fi
+done
 
 echo "verified: ${#bins[@]} binaries — exports allowlisted, consumer builds passed, consumer tests ran"
