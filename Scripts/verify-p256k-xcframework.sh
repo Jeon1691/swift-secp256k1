@@ -75,15 +75,33 @@ done
 # testName Xcode gives xctest's own process errors — a runner that never connected, crashed while bootstrapping or
 # couldn't launch — the bundle's only marker of a run no test judged; update if Xcode renames it.
 xctest_fault_name='^xctest( \([0-9]+\))? encountered an error$'
+# Runs per leg while every failure is such a fault: on the 20261123 xcode-27 image one VM in ten hit two in a row.
+max_attempts=3
+# A runtime disk image CoreSimulator is deleting or copying takes its runtime out of `simctl list` for 20–40 s;
+# wait out that window before each run, up to this cap, polling at this interval (seconds).
+settle_limit=120
+settle_poll=5
+
+settle_runtime_images() {
+    local waited=0
+    while xcrun simctl runtime list -j 2>/dev/null | jq -e 'any(.[]; .state != "Ready" and .state != "Unusable")' >/dev/null; do
+        if ((waited >= settle_limit)); then
+            echo "warning: runtime images still re-staging after ${settle_limit}s; continuing" >&2
+            return 0
+        fi
+        sleep "$settle_poll"
+        waited=$((waited + settle_poll))
+    done
+    ((waited == 0)) || echo "waited ${waited}s for runtime images to settle"
+}
 
 # build-for-testing proves a simulator slice links, not that it runs; no eligible device fails the gate.
 # Newest runtime whose major.minor ≤ the active SDK's (never one for a newer Xcode than the pin), compared
 # numerically; single-device-type runtimes are skipped by type count because their IDs can look general (iOS-27-1).
-run_simulator_leg() {
-    local dest=$1 platform=$2 sdk_name=$3 prefix=$4
-    local sdk rescan sims pick sim state label result attempt rc summary
-    command -v jq >/dev/null || die "jq is required to select and judge the simulator runs"
-    sdk=$(xcrun --sdk "$sdk_name" --show-sdk-version)
+# Sets sim, state and label in the caller.
+select_simulator() {
+    local platform=$1 prefix=$2 sdk=$3 dest=$4
+    local rescan sims pick
     for rescan in 0 1; do
         sims=$(xcrun simctl list --json)
         pick=$(jq -r --arg sdk "$sdk" --arg platform "$platform" --arg prefix "$prefix" '
@@ -97,7 +115,7 @@ run_simulator_leg() {
                | {v: $v, version: $r.version, udid, state: (.state | gsub(" "; "_")), name}]
             | max_by(.v) // empty | "\(.udid) \(.state) \(.name), \($platform) \(.version)"' <<<"$sims") || pick=''
         [[ -z "$pick" && $rescan == 0 ]] || break
-        # A runtime whose disk image CoreSimulator is re-staging drops out of `simctl list` until it is remounted.
+        # A runtime whose disk image was re-staged can stay out of `simctl list` until it is remounted.
         echo "warning: no eligible $prefix simulator listed; rescanning runtime images once" >&2
         xcrun simctl runtime scan-and-mount >&2 || true
     done
@@ -116,11 +134,19 @@ run_simulator_leg() {
     if [[ "$state" == Shutdown ]]; then
         booted_sims+=("$sim")
     fi
-    echo "consumer test: $dest ($label)"
+}
 
+run_simulator_leg() {
+    local dest=$1 platform=$2 sdk_name=$3 prefix=$4
+    local sdk sim state label result attempt rc summary
+    command -v jq >/dev/null || die "jq is required to select and judge the simulator runs"
+    sdk=$(xcrun --sdk "$sdk_name" --show-sdk-version)
     # -collect-test-diagnostics never: skip the simulator sysdiagnose a failing test otherwise waits on.
     result="$WORKDIR/$platform-simulator.xcresult"
-    for attempt in 1 2; do
+    for ((attempt = 1; ; attempt++)); do
+        settle_runtime_images
+        select_simulator "$platform" "$prefix" "$sdk" "$dest"
+        echo "consumer test: $dest ($label)"
         rm -rf "$result"
         rc=0
         xcodebuild test-without-building -scheme "$scheme" -destination "platform=$dest,id=$sim" -derivedDataPath "$WORKDIR/dd" -resultBundlePath "$result" -collect-test-diagnostics never -quiet || rc=$?
@@ -132,10 +158,14 @@ run_simulator_leg() {
         }
         ((rc != 0)) || break
         jq -r '.testFailures[]? | "failure: \(.testName // "?"): \(.failureText // "" | gsub("\n"; "\n    "))"' <<<"$summary" >&2 || true
-        # A failed run that no test judged is a simulator fault seen on fresh CI VMs, not a verdict: retry it once, but
-        # only when every recorded failure is xctest's own, so a real test failure can't be retried into a pass.
-        if ((attempt == 1)) && jq -e --arg fault "$xctest_fault_name" '(.passedTests // 0) == 0 and all(.testFailures[]?; .testName // "" | test($fault))' <<<"$summary" >/dev/null; then
-            echo "warning: $dest test run failed before any test reported a result; retrying once" >&2
+        # A failed run that no test judged is a simulator fault seen on fresh CI VMs, not a verdict: retry it, but only
+        # when every recorded failure is xctest's own, so a real test failure can't be retried into a pass.
+        if ((attempt < max_attempts)) && jq -e --arg fault "$xctest_fault_name" '(.passedTests // 0) == 0 and all(.testFailures[]?; .testName // "" | test($fault))' <<<"$summary" >/dev/null; then
+            echo "warning: $dest test run failed before any test reported a result; retrying (attempt $((attempt + 1)) of $max_attempts)" >&2
+            # Reboot fresh and re-pick: the fault can leave this device half-booted or its runtime unlisted.
+            if [[ "$state" == Shutdown ]]; then
+                xcrun simctl shutdown "$sim" >/dev/null 2>&1 || true
+            fi
         else
             echo "error: $dest consumer test failed (xcodebuild exit $rc)" >&2
             exit "$rc"

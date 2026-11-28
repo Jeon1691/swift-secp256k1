@@ -66,6 +66,7 @@ jobs:
           log="$RUNNER_TEMP/verify.log"
           if grep -q 'retrying once' "$log"; then echo "RETRY OBSERVED in $CASE"; fi
           if grep -q 'rescanning runtime images' "$log"; then echo "RESCAN OBSERVED in $CASE"; fi
+          grep -E 'waited [0-9]+s for runtime images|still re-staging' "$log" | sed "s/^/SETTLE OBSERVED in $CASE: /" || true
           grep -q ' consumer test: iOS Simulator passed [1-9]' "$log"
           case "$CASE" in
             gate-*)
