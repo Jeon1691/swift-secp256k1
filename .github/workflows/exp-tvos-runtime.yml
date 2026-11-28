@@ -1,6 +1,6 @@
 # TEMPORARY — fork-only experiment, not for upstream. Ten fresh VMs, each
 # running the iOS leg then the tvOS leg, to see when the tvOS 27.0 runtime
-# drops out of `simctl list` and what brings it back.
+# drops out of `simctl list`; run 2 deletes the Unusable images first.
 name: Experiment tvOS runtime dropout (temporary)
 on:
   push:
@@ -31,5 +31,20 @@ jobs:
             "https://github.com/21-DOT-DEV/swift-secp256k1/releases/download/$RELEASE_TAG/P256K.xcframework.zip"
           echo "$EXPECTED_SHA256  $RUNNER_TEMP/P256K.xcframework.zip" | shasum -a 256 -c
           unzip -q "$RUNNER_TEMP/P256K.xcframework.zip" -d "$RUNNER_TEMP/xcf"
+      - name: Remove unusable runtime images
+        run: |
+          # The 20261123 image ships a duplicate, Unusable tvOS 27.0 disk image that
+          # CoreSimulator keeps re-staging; does deleting it stop the dropouts?
+          xcrun simctl runtime list
+          t=$(date +%s)
+          xcrun simctl runtime delete --unusable || sudo xcrun simctl runtime delete --unusable
+          # Wait for the delete to settle: no image left Unusable/Deleting/Copying (cap 300 s).
+          for _ in $(seq 1 60); do
+            n=$(xcrun simctl runtime list -j | jq '[.[] | select(.state != "Ready")] | length')
+            [ "$n" -eq 0 ] && break
+            sleep 5
+          done
+          echo "settled after $(( $(date +%s) - t ))s, non-Ready images: $n"
+          xcrun simctl runtime list
       - name: iOS then tvOS
         run: bash .github/exp/tvos-runtime.sh "$RUNNER_TEMP/xcf/P256K.xcframework"

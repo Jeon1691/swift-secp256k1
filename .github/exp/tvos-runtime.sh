@@ -17,7 +17,7 @@ TV_RT=com.apple.CoreSimulator.SimRuntime.tvOS-27-0
 BOOT_LIMIT=300   # seconds; bootstatus can wait forever on an unmounted runtime
 
 listed() { xcrun simctl list runtimes -j | jq -r '[.runtimes[] | select(.platform == "tvOS") | .version] | join(",")'; }
-images() { xcrun simctl runtime list -j | jq -r '[.[] | select(.platformIdentifier == "com.apple.platform.appletvsimulator") | "\(.version):\(.state):mounted=\(.mountPath != null)"] | join(",")'; }
+images() { xcrun simctl runtime list -j | jq -r '([.[] | select(.platformIdentifier == "com.apple.platform.appletvsimulator") | "\(.version):\(.state):mounted=\(.mountPath != null)"] | join(",")) + " non_ready_all=\([.[] | select(.state != "Ready")] | length)"'; }
 snap() { echo "SNAP $(date -u +%H:%M:%S) $1 listed=[$(listed)] images=[$(images)]"; }
 tv_listed() { [[ ",$(listed)," == *",27.0,"* ]]; }
 # with_limit <secs> <cmd...>: run cmd, kill it after secs; returns its status (or 124 on timeout)
