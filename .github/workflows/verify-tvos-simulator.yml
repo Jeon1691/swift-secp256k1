@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        case: [gate-1, gate-2, gate-3, gate-4, tvos-fail, tvos-zero]
+        case: [gate-1, gate-2, gate-3, gate-4, gate-5, gate-6, gate-7, gate-8, gate-9, gate-10, tvos-fail, tvos-zero]
     env:
       # Same pin as xcframework-release.yml.
       DEVELOPER_DIR: /Applications/Xcode_27.0.app/Contents/Developer
@@ -65,6 +65,7 @@ jobs:
           echo "verifier exit: $rc"
           log="$RUNNER_TEMP/verify.log"
           if grep -q 'retrying once' "$log"; then echo "RETRY OBSERVED in $CASE"; fi
+          if grep -q 'rescanning runtime images' "$log"; then echo "RESCAN OBSERVED in $CASE"; fi
           grep -q ' consumer test: iOS Simulator passed [1-9]' "$log"
           case "$CASE" in
             gate-*)

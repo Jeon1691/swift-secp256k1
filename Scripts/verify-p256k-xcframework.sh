@@ -72,36 +72,44 @@ for dest in "$@"; do
     xcodebuild build-for-testing -scheme "$scheme" -destination "generic/platform=$dest" -derivedDataPath "$WORKDIR/dd" CODE_SIGNING_ALLOWED=NO ONLY_ACTIVE_ARCH=NO -quiet
 done
 
-# Xcode's failureText when the runner never connects — the bundle's only marker of that state; update if Xcode rewords it.
-runner_hang_text='hung before establishing connection'
+# testName Xcode gives xctest's own process errors — a runner that never connected, crashed while bootstrapping or
+# couldn't launch — the bundle's only marker of a run no test judged; update if Xcode renames it.
+xctest_fault_name='^xctest( \([0-9]+\))? encountered an error$'
 
 # build-for-testing proves a simulator slice links, not that it runs; no eligible device fails the gate.
 # Newest runtime whose major.minor ≤ the active SDK's (never one for a newer Xcode than the pin), compared
 # numerically; single-device-type runtimes are skipped by type count because their IDs can look general (iOS-27-1).
-# Usage: run_simulator_leg <archive destination> <simctl platform> <SDK name> <device name prefix>
 run_simulator_leg() {
     local dest=$1 platform=$2 sdk_name=$3 prefix=$4
-    local sdk sims pick sim state label result attempt rc summary
+    local sdk rescan sims pick sim state label result attempt rc summary
+    command -v jq >/dev/null || die "jq is required to select and judge the simulator runs"
     sdk=$(xcrun --sdk "$sdk_name" --show-sdk-version)
-    sims=$(xcrun simctl list --json)
-    pick=$(jq -r --arg sdk "$sdk" --arg platform "$platform" --arg prefix "$prefix" '
-        def ver: split(".") | map(tonumber);
-        def major_minor: (. + [0, 0])[:2];
-        ($sdk | ver | major_minor) as $cap | .devices as $devices
-        | [.runtimes[] as $r
-           | select($r.platform == $platform and $r.isAvailable and ($r.supportedDeviceTypes | length) > 1)
-           | ($r.version | ver) as $v | select(($v | major_minor) <= $cap)
-           | ($devices[$r.identifier] // [])[] | select(.isAvailable and (.name | startswith($prefix)))
-           | {v: $v, version: $r.version, udid, state: (.state | gsub(" "; "_")), name}]
-        | max_by(.v) // empty | "\(.udid) \(.state) \(.name), \($platform) \(.version)"' <<<"$sims") || pick=''
+    for rescan in 0 1; do
+        sims=$(xcrun simctl list --json)
+        pick=$(jq -r --arg sdk "$sdk" --arg platform "$platform" --arg prefix "$prefix" '
+            def ver: split(".") | map(tonumber);
+            def major_minor: (. + [0, 0])[:2];
+            ($sdk | ver | major_minor) as $cap | .devices as $devices
+            | [.runtimes[] as $r
+               | select($r.platform == $platform and $r.isAvailable and ($r.supportedDeviceTypes | length) > 1)
+               | ($r.version | ver) as $v | select(($v | major_minor) <= $cap)
+               | ($devices[$r.identifier] // [])[] | select(.isAvailable and (.name | startswith($prefix)))
+               | {v: $v, version: $r.version, udid, state: (.state | gsub(" "; "_")), name}]
+            | max_by(.v) // empty | "\(.udid) \(.state) \(.name), \($platform) \(.version)"' <<<"$sims") || pick=''
+        [[ -z "$pick" && $rescan == 0 ]] || break
+        # A runtime whose disk image CoreSimulator is re-staging drops out of `simctl list` until it is remounted.
+        echo "warning: no eligible $prefix simulator listed; rescanning runtime images once" >&2
+        xcrun simctl runtime scan-and-mount >&2 || true
+    done
     if [[ -z "$pick" ]]; then
         echo "$platform runtimes and devices simctl reported:" >&2
         jq -r --arg platform "$platform" 'def err: if .availabilityError then " (\(.availabilityError))" else "" end;
             def rt: ltrimstr("com.apple.CoreSimulator.SimRuntime.");
-            (.runtimes[]? | select(.platform == $platform)
-             | "  runtime \(.identifier | rt) \(.version) available=\(.isAvailable) device_types=\(.supportedDeviceTypes | length)\(err)"),
-            (.devices // {} | to_entries[] | select(.key | contains("SimRuntime.\($platform)-")) | (.key | rt) as $rt
-             | .value[] | "  device \($rt) \(.name) \(.state) available=\(.isAvailable)\(err)")' <<<"$sims" >&2 || true
+            [(.runtimes[]? | select(.platform == $platform)
+              | "  runtime \(.identifier | rt) \(.version) available=\(.isAvailable) device_types=\(.supportedDeviceTypes | length)\(err)"),
+             (.devices // {} | to_entries[] | select(.key | contains("SimRuntime.\($platform)-")) | (.key | rt) as $rt
+              | .value[] | "  device \($rt) \(.name) \(.state) available=\(.isAvailable)\(err)")]
+            | if length == 0 then "  (none)" else .[] end' <<<"$sims" >&2 || true
         die "$dest slice archived but no available $prefix simulator on any $platform runtime ≤ the $sdk SDK"
     fi
     read -r sim state label <<<"$pick"
@@ -124,10 +132,10 @@ run_simulator_leg() {
         }
         ((rc != 0)) || break
         jq -r '.testFailures[]? | "failure: \(.testName // "?"): \(.failureText // "" | gsub("\n"; "\n    "))"' <<<"$summary" >&2 || true
-        # A runner that never connects is a simulator fault seen on fresh CI VMs, not a test verdict: retry it once,
-        # but only when that is every recorded failure, so a real test failure can't be retried into a pass.
-        if ((attempt == 1)) && jq -e --arg hang "$runner_hang_text" '[.testFailures[]?.failureText // ""] | length > 0 and all(contains($hang))' <<<"$summary" >/dev/null; then
-            echo "warning: $dest test runner never connected; retrying once" >&2
+        # A failed run that no test judged is a simulator fault seen on fresh CI VMs, not a verdict: retry it once, but
+        # only when every recorded failure is xctest's own, so a real test failure can't be retried into a pass.
+        if ((attempt == 1)) && jq -e --arg fault "$xctest_fault_name" '(.passedTests // 0) == 0 and all(.testFailures[]?; .testName // "" | test($fault))' <<<"$summary" >/dev/null; then
+            echo "warning: $dest test run failed before any test reported a result; retrying once" >&2
         else
             echo "error: $dest consumer test failed (xcodebuild exit $rc)" >&2
             exit "$rc"
@@ -138,6 +146,10 @@ run_simulator_leg() {
     jq -e '.result == "Passed" and .passedTests > 0 and .failedTests == 0' <<<"$summary" >/dev/null ||
         die "$dest run reported no passing test: $(jq -c '{result, totalTestCount, passedTests, failedTests}' <<<"$summary")"
     echo "consumer test: $dest passed $(jq -r '.passedTests' <<<"$summary") test(s)"
+    # Free a simulator this leg booted before the next leg boots its own; the trap still covers failure exits.
+    if [[ "$state" == Shutdown ]]; then
+        xcrun simctl shutdown "$sim" >/dev/null 2>&1 || true
+    fi
 }
 
 # archive destination | simctl platform | SDK name | device name prefix
@@ -148,7 +160,6 @@ simulator_legs=(
 for leg in "${simulator_legs[@]}"; do
     IFS='|' read -r dest platform sdk_name prefix <<<"$leg"
     if [[ " $* " == *" $dest "* ]]; then
-        command -v jq >/dev/null || die "jq is required to select and judge the simulator runs"
         run_simulator_leg "$dest" "$platform" "$sdk_name" "$prefix"
     fi
 done
