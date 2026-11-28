@@ -1,0 +1,35 @@
+# TEMPORARY — fork-only experiment, not for upstream. Ten fresh VMs, each
+# running the iOS leg then the tvOS leg, to see when the tvOS 27.0 runtime
+# drops out of `simctl list` and what brings it back.
+name: Experiment tvOS runtime dropout (temporary)
+on:
+  push:
+    branches: ['exp/**']
+permissions: {}
+jobs:
+  leg:
+    name: rep-${{ matrix.rep }}
+    runs-on: xcode-27
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        rep: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    env:
+      # Same pin as xcframework-release.yml.
+      DEVELOPER_DIR: /Applications/Xcode_27.0.app/Contents/Developer
+      RELEASE_TAG: '0.25.1'
+      # Digest GitHub records for the 0.25.1 P256K.xcframework.zip asset.
+      EXPECTED_SHA256: 98ae10faf5655da4240355432add79f5733dc666a162ed06ed0d5f051a48dbaa
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Fetch release artifact
+        run: |
+          curl -sSfL --retry 3 -o "$RUNNER_TEMP/P256K.xcframework.zip" \
+            "https://github.com/21-DOT-DEV/swift-secp256k1/releases/download/$RELEASE_TAG/P256K.xcframework.zip"
+          echo "$EXPECTED_SHA256  $RUNNER_TEMP/P256K.xcframework.zip" | shasum -a 256 -c
+          unzip -q "$RUNNER_TEMP/P256K.xcframework.zip" -d "$RUNNER_TEMP/xcf"
+      - name: iOS then tvOS
+        run: bash .github/exp/tvos-runtime.sh "$RUNNER_TEMP/xcf/P256K.xcframework"
